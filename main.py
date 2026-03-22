@@ -2286,6 +2286,8 @@ class _InternalMailer:
                         if len(self._q) < 2000:
                             self._q.append(item)
 
+    def _deliver_direct(self, msg_bytes: bytes, to_addr: str) -> bool:
+        import smtplib
 
 _INTERNAL_MAILER: _InternalMailer | None = None
 
@@ -2398,6 +2400,9 @@ def send_email(to_addr: str, subject: str, text_body: str, html_body: str | None
     # Fallback: SMTP relay using secure-email (still no external API like SendGrid)
     return send_email_via_secure_email(to_addr, subject, text_body, html_body)
 
+    Modes:
+      - One-container mode (default): in-process outbound mailer that delivers to MX directly.
+      - SMTP relay mode: use `secure-email` package to send via configured SMTP relay.
 
 def _generate_weather_report_for_user(username: str, lat: float, lon: float, wx: dict[str, Any]) -> str:
     """Server-side weather report generator for alerts (no session dependency)."""
@@ -2700,6 +2705,11 @@ class MultiKeySessionInterface(SecureCookieSessionInterface):
             samesite=samesite,
         )
 
+    def open_session(self, app, request):
+        cookie_name = self.get_cookie_name(app)
+        cookie_value = request.cookies.get(cookie_name)
+        if not cookie_value:
+            return self.session_class()
 
 app.session_interface = MultiKeySessionInterface()
 
@@ -2786,6 +2796,24 @@ app.config.update(SESSION_COOKIE_SECURE=True,
 
 csrf = CSRFProtect(app)
 
+def usage_series_days(days: int = 14) -> list[dict[str, Any]]:
+    days = max(1, min(60, int(days)))
+    today = datetime.utcnow().date()
+    start_day = today - timedelta(days=days-1)
+    series = { (start_day + timedelta(days=i)).isoformat(): 0 for i in range(days) }
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT date(ts, 'unixepoch') AS d, COUNT(*) FROM user_query_events WHERE ts >= ? GROUP BY d",
+                (int(datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc).timestamp()),),
+            )
+            for d, c in cur.fetchall():
+                if d in series:
+                    series[str(d)] = int(c)
+    except Exception:
+        pass
+    return [{"day": k, "count": v} for k, v in series.items()]
 
 @app.template_filter("datetimeformat")
 def _dtfmt(ts: int) -> str:
@@ -2943,6 +2971,13 @@ def _rgb01_to_hex(r,g,b):
 
 def _approx_oklch_from_rgb(r: float, g: float, b: float) -> tuple[float, float, float]:
 
+SIG_ALG_IDS = {
+    "ML-DSA-87": ("ML-DSA-87", "MLD3"),
+    "ML-DSA-65": ("ML-DSA-65", "MLD2"),
+    "Dilithium5": ("Dilithium5", "MLD5"),
+    "Dilithium3": ("Dilithium3", "MLD3"),
+    "Ed25519": ("Ed25519", "ED25"),
+}
 
     r = 0.0 if r < 0.0 else 1.0 if r > 1.0 else r
     g = 0.0 if g < 0.0 else 1.0 if g > 1.0 else g
@@ -2950,6 +2985,9 @@ def _approx_oklch_from_rgb(r: float, g: float, b: float) -> tuple[float, float, 
 
     hue_hls, light_hls, sat_hls = colorsys.rgb_to_hls(r, g, b)
 
+def hkdf_sha3(key_material: bytes, info: bytes = b"", length: int = 32, salt: Optional[bytes] = None) -> bytes:
+    hkdf = HKDF(algorithm=SHA3_512(), length=length, salt=salt, info=info, backend=default_backend())
+    return hkdf.derive(key_material)
 
     luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
 
@@ -3076,6 +3114,13 @@ class ColorSync:
             h /= 6
         return int(h * 360), int(s * 100), int(l * 100)
 
+            # Convert to perceptual coordinates
+            h, s, l = self._rgb_to_hsl(j)
+            L, C, H = _approx_oklch_from_rgb(
+                (j >> 16 & 0xFF) / 255.0,
+                (j >> 8 & 0xFF) / 255.0,
+                (j & 0xFF) / 255.0,
+            )
 
 colorsync = ColorSync()
 
@@ -3091,6 +3136,17 @@ def _gf256_mul(a: int, b: int) -> int:
         b >>= 1
     return p
 
+        pool_parts = [
+            secrets.token_bytes(32),
+            os.urandom(32),
+            uuid.uuid4().bytes,
+            str((time.time_ns(), time.perf_counter_ns())).encode(),
+            f"{os.getpid()}:{os.getppid()}:{threading.get_ident()}".encode(),
+            int(cpu * 100).to_bytes(2, "big"),
+            int(ram * 100).to_bytes(2, "big"),
+            self._epoch,
+        ]
+        pool = b"|".join(pool_parts)
 
 def _gf256_pow(a: int, e: int) -> int:
     x = 1
@@ -3132,6 +3188,7 @@ def shamir_recover(shares: list[tuple[int, bytes]], t: int) -> bytes:
 
     return bytes(out)
 
+colorsync = ColorSync()
 
 SEALED_DIR   = Path("./sealed_store")
 SEALED_FILE  = SEALED_DIR / "sealed.json.enc"
